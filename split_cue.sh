@@ -176,8 +176,18 @@ split_with_cue() {
     if [ "$use_ffmpeg" = true ]; then
         print_info "Using ffmpeg to split tracks preserving exact quality..."
 
+        # Convert CUE file to UTF-8 for proper title extraction (keep original for breakpoints)
+        local original_cue_file="$abs_cue_file"
+        local utf8_cue_file="${abs_cue_file}.utf8"
+        if iconv -f ISO-8859-1 -t UTF-8 "$abs_cue_file" > "$utf8_cue_file" 2>/dev/null; then
+            print_info "Converted CUE file to UTF-8 for proper character handling"
+        else
+            print_warning "Could not convert CUE file encoding, using original"
+            cp "$abs_cue_file" "$utf8_cue_file"
+        fi
+
         # Get number of tracks from CUE file
-        local num_tracks=$(grep -c "^  TRACK" "$abs_cue_file")
+        local num_tracks=$(grep -c "^  TRACK" "$original_cue_file")
 
         if [ $num_tracks -eq 0 ]; then
             print_error "No tracks found in CUE file"
@@ -197,19 +207,22 @@ split_with_cue() {
             echo "$minutes * 60 + $seconds" | bc -l
         }
 
-        # Get all breakpoints and prepend 0.0 for first track
-        local breakpoints=$(echo "0:00.00"; cuebreakpoints "$abs_cue_file" 2>/dev/null | grep -E '^[0-9]+:')
+        # Get all breakpoints from original CUE file (ISO-8859-1 works better with cuebreakpoints)
+        local breakpoints=$(echo "0:00.00"; cuebreakpoints "$original_cue_file" 2>/dev/null | grep -E '^[0-9]+:')
+        local bp_count=$(echo "$breakpoints" | wc -l | tr -d ' ')
+        print_info "Extracted $bp_count breakpoints from CUE file"
 
-        # Extract album metadata from CUE file
-        local album_artist=$(grep -m1 "PERFORMER" "$abs_cue_file" | sed 's/.*PERFORMER "\(.*\)"/\1/' | tr -d '\r')
-        local album_name=$(grep -m1 "TITLE" "$abs_cue_file" | sed 's/.*TITLE "\(.*\)"/\1/' | tr -d '\r')
-        local album_date=$(grep -m1 "REM DATE" "$abs_cue_file" | sed 's/.*REM DATE \(.*\)/\1/' | tr -d '\r')
+        # Extract album metadata from UTF-8 CUE file for proper character handling
+        local album_artist=$(grep -m1 "PERFORMER" "$utf8_cue_file" | sed 's/.*PERFORMER "\(.*\)"/\1/' | tr -d '\r')
+        local album_name=$(grep -m1 "TITLE" "$utf8_cue_file" | sed 's/.*TITLE "\(.*\)"/\1/' | tr -d '\r')
+        local album_date=$(grep -m1 "REM DATE" "$utf8_cue_file" | sed 's/.*REM DATE \(.*\)/\1/' | tr -d '\r')
 
         local track=1
         local success=true
         while [ $track -le $num_tracks ]; do
-            # Get track title from CUE and remove carriage returns and other problematic characters
-            local title=$(awk "/TRACK $(printf "%02d" $track)/{flag=1} flag && /TITLE/{print; exit}" "$abs_cue_file" | sed 's/.*TITLE "\(.*\)"/\1/' | tr -d '\r' | sed 's/[<>:"|?*]/_/g')
+            # Get track title from UTF-8 CUE file for proper character handling
+            # Use grep with -A to get the TITLE line after the TRACK line
+            local title=$(grep -A 10 "TRACK $(printf "%02d" $track)" "$utf8_cue_file" | grep -m1 "TITLE" | sed 's/.*TITLE "\(.*\)"/\1/' | tr -d '\r' | sed 's/[<>:"|?*\/]/_/g')
 
             # Get track start time from breakpoints (line number = track number)
             local start_time_raw=$(echo "$breakpoints" | sed -n "${track}p")
@@ -262,6 +275,7 @@ split_with_cue() {
         if [ "$success" = false ]; then
             cd "$working_dir"
             rm -rf "$temp_dir"
+            rm -f "$utf8_cue_file"
             return 1
         fi
 
@@ -271,10 +285,14 @@ split_with_cue() {
             print_error "Only $ffmpeg_created_tracks out of $num_tracks tracks were created using ffmpeg!"
             cd "$working_dir"
             rm -rf "$temp_dir"
+            rm -f "$utf8_cue_file"
             return 1
         fi
 
         print_info "Successfully split tracks using ffmpeg ($ffmpeg_created_tracks/$num_tracks tracks, quality preserved)"
+
+        # Clean up UTF-8 temp CUE file
+        rm -f "$utf8_cue_file"
     fi
 
     # If we got here, splitting succeeded
