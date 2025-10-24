@@ -134,6 +134,10 @@ split_with_cue() {
     local abs_cue_file="$(cd "$(dirname "$cue_file")" && pwd)/$(basename "$cue_file")"
     local abs_process_file="$(cd "$(dirname "$process_file")" && pwd)/$(basename "$process_file")"
 
+    # Count expected tracks from CUE file
+    local expected_tracks=$(grep -c "^  TRACK" "$abs_cue_file")
+    print_info "Expected tracks from CUE file: $expected_tracks"
+
     cd "$temp_dir"
 
     # Try to split directly first
@@ -142,11 +146,34 @@ split_with_cue() {
     local split_error=$(shnsplit -f "$abs_cue_file" -t "%n - %t" -o "flac flac -8 -o %f -" "$abs_process_file" 2>&1)
     local split_status=$?
 
-    if [ $split_status -eq 0 ] && [ -n "$(ls -A *.flac 2>/dev/null)" ]; then
-        print_info "Successfully split tracks directly"
+    # Count how many tracks were actually created
+    local created_tracks=$(ls -1 *.flac 2>/dev/null | wc -l | tr -d ' ')
+
+    # Check if all expected tracks were created
+    local use_ffmpeg=false
+    if [ $split_status -eq 0 ] && [ "$created_tracks" -eq "$expected_tracks" ]; then
+        print_info "Successfully split tracks directly ($created_tracks/$expected_tracks tracks)"
+    elif [ "$created_tracks" -gt 0 ] && [ "$created_tracks" -lt "$expected_tracks" ]; then
+        print_error "Only $created_tracks out of $expected_tracks tracks were created!"
+        print_error "This usually indicates character encoding issues in the CUE file"
+        print_warning "Attempting ffmpeg method instead..."
+        # Clean up partial split
+        rm -f *.flac
+        use_ffmpeg=true
     elif [[ "$abs_process_file" == *.flac ]]; then
-        # If direct split failed, use ffmpeg to split while preserving quality
+        # shnsplit failed completely, try ffmpeg
         print_warning "Direct split failed, using ffmpeg method (preserves original quality)..."
+        use_ffmpeg=true
+    else
+        print_error "Failed to split file"
+        echo "$split_error"
+        cd "$working_dir"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # Use ffmpeg method if needed
+    if [ "$use_ffmpeg" = true ]; then
         print_info "Using ffmpeg to split tracks preserving exact quality..."
 
         # Get number of tracks from CUE file
@@ -238,13 +265,16 @@ split_with_cue() {
             return 1
         fi
 
-        print_info "Successfully split tracks using ffmpeg (quality preserved)"
-    else
-        print_error "Failed to split file"
-        echo "$split_error"
-        cd "$working_dir"
-        rm -rf "$temp_dir"
-        return 1
+        # Verify all tracks were created
+        local ffmpeg_created_tracks=$(ls -1 *.flac 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$ffmpeg_created_tracks" -ne "$num_tracks" ]; then
+            print_error "Only $ffmpeg_created_tracks out of $num_tracks tracks were created using ffmpeg!"
+            cd "$working_dir"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        print_info "Successfully split tracks using ffmpeg ($ffmpeg_created_tracks/$num_tracks tracks, quality preserved)"
     fi
 
     # If we got here, splitting succeeded
@@ -352,7 +382,105 @@ process_directory() {
     total_count=${#cue_files_array[@]}
 
     if [ $total_count -eq 0 ]; then
-        print_warning "No CUE files found in: $search_dir"
+        print_info "No external CUE files found, checking for embedded cue sheets..."
+
+        # Look for FLAC files with embedded cue sheets
+        local files_with_embedded_cue=()
+
+        # Change to search directory for glob expansion
+        local current_dir="$(pwd)"
+        cd "$search_dir"
+
+        # Enable nullglob so unmatched patterns expand to nothing
+        shopt -s nullglob
+
+        for ext in flac ape wv; do
+            for audio_file in *."$ext"; do
+                [ -f "$audio_file" ] || continue
+
+                # Get full path
+                local full_path="$(pwd)/$audio_file"
+
+                # Check if file has embedded cuesheet metadata
+                local has_cuesheet=false
+
+                # Try metaflac first (for FLAC files)
+                if [[ "$full_path" == *.flac ]]; then
+                    if [ -n "$(metaflac --list "$full_path" 2>/dev/null | grep -i "cuesheet")" ]; then
+                        has_cuesheet=true
+                    fi
+                fi
+
+                # Try ffprobe (for all formats)
+                if [ "$has_cuesheet" = false ]; then
+                    if [ -n "$(ffprobe "$full_path" 2>&1 | grep -i "cuesheet")" ]; then
+                        has_cuesheet=true
+                    fi
+                fi
+
+                if [ "$has_cuesheet" = true ]; then
+                    files_with_embedded_cue+=("$full_path")
+                fi
+            done
+        done
+
+        # Restore normal glob behavior
+        shopt -u nullglob
+
+        cd "$current_dir"
+
+        if [ ${#files_with_embedded_cue[@]} -eq 0 ]; then
+            print_warning "No CUE files or embedded cue sheets found in: $search_dir"
+            return 0
+        fi
+
+        print_info "Found ${#files_with_embedded_cue[@]} file(s) with embedded cue sheets"
+        echo ""
+
+        # Process files with embedded cue sheets
+        for audio_file in "${files_with_embedded_cue[@]}"; do
+            print_info "Processing file with embedded cue sheet: $(basename "$audio_file")"
+
+            # Extract embedded cue sheet to temporary file
+            local base_name="${audio_file%.*}"
+            local temp_cue="${base_name}.cue.tmp"
+
+            # Try to extract based on file type
+            if [[ "$audio_file" == *.flac ]]; then
+                # For FLAC files, use metaflac
+                metaflac --export-cuesheet-to="$temp_cue" "$audio_file" 2>/dev/null
+            elif [[ "$audio_file" == *.wv ]]; then
+                # For WavPack files, use wvunpack to extract embedded cuesheet
+                # Skip the first 3 lines (program header)
+                wvunpack -c "$audio_file" 2>&1 | tail -n +4 > "$temp_cue"
+            elif [[ "$audio_file" == *.ape ]]; then
+                # For APE files, try ffprobe extraction
+                ffprobe -v quiet -print_format json -show_format "$audio_file" 2>/dev/null | \
+                    grep -oP '"cuesheet"\s*:\s*"\K[^"]+' | sed 's/\\n/\n/g' > "$temp_cue" 2>/dev/null
+            fi
+
+            # If that didn't work, try universal ffprobe extraction
+            if [ ! -f "$temp_cue" ] || [ ! -s "$temp_cue" ]; then
+                ffprobe -v quiet -print_format json -show_format "$audio_file" 2>/dev/null | \
+                    grep -oP '"cuesheet"\s*:\s*"\K[^"]+' | sed 's/\\n/\n/g' > "$temp_cue" 2>/dev/null
+            fi
+
+            if [ -f "$temp_cue" ] && [ -s "$temp_cue" ]; then
+                # Process with the temporary cue file
+                if split_with_cue "$audio_file" "$temp_cue"; then
+                    print_info "✓ Successfully processed: $(basename "$audio_file")"
+                    rm -f "$temp_cue"
+                else
+                    print_error "✗ Failed to process: $(basename "$audio_file")"
+                    rm -f "$temp_cue"
+                fi
+            else
+                print_error "Failed to extract embedded cue sheet from: $(basename "$audio_file")"
+                rm -f "$temp_cue"
+            fi
+            echo ""
+        done
+
         return 0
     fi
 
