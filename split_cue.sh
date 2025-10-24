@@ -136,12 +136,120 @@ split_with_cue() {
 
     cd "$temp_dir"
 
-    # Use cuebreakpoints to split
+    # Try to split directly first
     # Using -8 (high compression, still lossless - audio quality is identical)
-    if shnsplit -f "$abs_cue_file" -t "%n - %t" -o "flac flac -8 -o %f -" "$abs_process_file"; then
-        print_info "Successfully split into tracks"
+    # Capture stderr to check for format errors
+    local split_error=$(shnsplit -f "$abs_cue_file" -t "%n - %t" -o "flac flac -8 -o %f -" "$abs_process_file" 2>&1)
+    local split_status=$?
 
-        # Move split files to the original directory
+    if [ $split_status -eq 0 ] && [ -n "$(ls -A *.flac 2>/dev/null)" ]; then
+        print_info "Successfully split tracks directly"
+    elif [[ "$abs_process_file" == *.flac ]]; then
+        # If direct split failed, use ffmpeg to split while preserving quality
+        print_warning "Direct split failed, using ffmpeg method (preserves original quality)..."
+        print_info "Using ffmpeg to split tracks preserving exact quality..."
+
+        # Get number of tracks from CUE file
+        local num_tracks=$(grep -c "^  TRACK" "$abs_cue_file")
+
+        if [ $num_tracks -eq 0 ]; then
+            print_error "No tracks found in CUE file"
+            cd "$working_dir"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        # Parse each track from CUE and split using ffmpeg
+        # Function to convert M:SS.FF format to seconds
+        convert_time_to_seconds() {
+            local time="$1"
+            # Format is M:SS.FF or MM:SS.FF
+            local minutes=$(echo "$time" | cut -d: -f1)
+            local seconds=$(echo "$time" | cut -d: -f2)
+            # Convert to total seconds (ignore frames, they're 1/75th of a second)
+            echo "$minutes * 60 + $seconds" | bc -l
+        }
+
+        # Get all breakpoints and prepend 0.0 for first track
+        local breakpoints=$(echo "0:00.00"; cuebreakpoints "$abs_cue_file" 2>/dev/null | grep -E '^[0-9]+:')
+
+        # Extract album metadata from CUE file
+        local album_artist=$(grep -m1 "PERFORMER" "$abs_cue_file" | sed 's/.*PERFORMER "\(.*\)"/\1/' | tr -d '\r')
+        local album_name=$(grep -m1 "TITLE" "$abs_cue_file" | sed 's/.*TITLE "\(.*\)"/\1/' | tr -d '\r')
+        local album_date=$(grep -m1 "REM DATE" "$abs_cue_file" | sed 's/.*REM DATE \(.*\)/\1/' | tr -d '\r')
+
+        local track=1
+        local success=true
+        while [ $track -le $num_tracks ]; do
+            # Get track title from CUE and remove carriage returns and other problematic characters
+            local title=$(awk "/TRACK $(printf "%02d" $track)/{flag=1} flag && /TITLE/{print; exit}" "$abs_cue_file" | sed 's/.*TITLE "\(.*\)"/\1/' | tr -d '\r' | sed 's/[<>:"|?*]/_/g')
+
+            # Get track start time from breakpoints (line number = track number)
+            local start_time_raw=$(echo "$breakpoints" | sed -n "${track}p")
+            local start_time=$(convert_time_to_seconds "$start_time_raw")
+
+            # Get next track start time (for duration)
+            local next_track=$((track + 1))
+            local end_time_raw=$(echo "$breakpoints" | sed -n "${next_track}p")
+            local end_time=""
+            if [ -n "$end_time_raw" ]; then
+                end_time=$(convert_time_to_seconds "$end_time_raw")
+            fi
+
+            local output_file="${temp_dir}/$(printf "%02d" $track) - ${title}.flac"
+
+            if [ -n "$end_time" ]; then
+                # Not the last track - specify duration
+                # Use -map_metadata -1 to strip all metadata including embedded cue sheets
+                ffmpeg -i "$abs_process_file" -ss "$start_time" -to "$end_time" -map 0:a -c:a flac -compression_level 8 \
+                    -map_metadata -1 \
+                    -metadata title="$title" \
+                    -metadata track="$track/$num_tracks" \
+                    -metadata artist="$album_artist" \
+                    -metadata album_artist="$album_artist" \
+                    -metadata album="$album_name" \
+                    -metadata date="$album_date" \
+                    "$output_file" -y 2>&1 | grep -v "^ffmpeg version" | grep -v "^  configuration:" | grep -v "^  lib" || true
+            else
+                # Last track - go to end of file
+                ffmpeg -i "$abs_process_file" -ss "$start_time" -map 0:a -c:a flac -compression_level 8 \
+                    -map_metadata -1 \
+                    -metadata title="$title" \
+                    -metadata track="$track/$num_tracks" \
+                    -metadata artist="$album_artist" \
+                    -metadata album_artist="$album_artist" \
+                    -metadata album="$album_name" \
+                    -metadata date="$album_date" \
+                    "$output_file" -y 2>&1 | grep -v "^ffmpeg version" | grep -v "^  configuration:" | grep -v "^  lib" || true
+            fi
+
+            if [ ! -f "$output_file" ]; then
+                print_error "Failed to create track $track: start=$start_time, end=$end_time"
+                success=false
+                break
+            fi
+
+            ((track++))
+        done
+
+        if [ "$success" = false ]; then
+            cd "$working_dir"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        print_info "Successfully split tracks using ffmpeg (quality preserved)"
+    else
+        print_error "Failed to split file"
+        echo "$split_error"
+        cd "$working_dir"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # If we got here, splitting succeeded
+    # Move split files to the original directory
+    if true; then
         for split_file in *.flac; do
             if [ -f "$split_file" ]; then
                 # Extract track number from filename and remove leading zeros for printf
