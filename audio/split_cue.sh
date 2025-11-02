@@ -14,7 +14,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Function to print colored messages
 print_info() {
     printf "${GREEN}[INFO]${NC} %s\n" "$1"
 }
@@ -27,7 +26,6 @@ print_warning() {
     printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
 }
 
-# Function to check if required tools are installed
 check_dependencies() {
     local missing_tools=()
 
@@ -44,7 +42,6 @@ check_dependencies() {
     fi
 }
 
-# Function to convert APE to FLAC
 ape_to_flac() {
     local ape_file="$1"
     local flac_file="${ape_file%.ape}.flac"
@@ -64,7 +61,6 @@ ape_to_flac() {
     echo "$flac_file"
 }
 
-# Function to convert WavPack to FLAC
 wv_to_flac() {
     local wv_file="$1"
     local flac_file="${wv_file%.wv}.flac"
@@ -84,7 +80,7 @@ wv_to_flac() {
     echo "$flac_file"
 }
 
-# Function to split a single file with CUE
+# Split a single file with CUE
 split_with_cue() {
     local audio_file="$1"
     local cue_file="$2"
@@ -372,7 +368,7 @@ split_with_cue() {
     fi
 }
 
-# Function to find and process audio files with CUE sheets
+# Find and process audio files with CUE sheets
 process_directory() {
     local search_dir="$1"
     local success_count=0
@@ -572,7 +568,6 @@ process_directory() {
     print_info "================================"
 }
 
-# Main script
 main() {
     print_info "CUE Sheet Audio Splitter"
     print_info "========================="
